@@ -1,0 +1,116 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { xmpPdf, signedPdf, countMarker } from './helpers.js';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(HERE, '..', '..');
+const WASM_MODULE = path.join(ROOT, 'wasm', 'out', 'hyper-compress.wasm');
+const PKG = path.join(ROOT, 'packages', 'npm', 'hyper-compress-wasm');
+const FIXTURE = path.join(
+  ROOT, 'tests', 'regression', 'failset', 'govdocs001-0142b23c0caa.pdf',
+);
+const LATIN1_PASSWORD_FIXTURES = ['40', '128'].map((bits) =>
+  path.join(ROOT, 'tests', 'fixtures', `latin1-password-${bits}.pdf`),
+);
+
+interface PackageSurface {
+  compress(
+    input: Uint8Array,
+    opts?: {
+      preset?: string;
+      options?: Record<string, unknown>;
+      password?: string;
+    },
+  ): Promise<{
+    originalSize: number;
+    compressedSize: number;
+    data: Uint8Array;
+    signed: boolean;
+    signaturesRemoved: boolean;
+    warnings: string[];
+  }>;
+  verifyPassword(input: Uint8Array, password: string): Promise<boolean>;
+}
+
+let packaged: Promise<PackageSurface> | null = null;
+
+function loadPackage(): Promise<PackageSurface> {
+  packaged ??= (async () => {
+    execFileSync('bash', [path.join(ROOT, 'scripts', 'pack-wasm-npm.sh')], {
+      stdio: 'pipe',
+    });
+    return (await import(
+      pathToFileURL(path.join(PKG, 'index.js')).href
+    )) as PackageSurface;
+  })();
+  return packaged;
+}
+
+const opts = {
+  skip: existsSync(WASM_MODULE) ? false : 'wasm/out not built',
+};
+
+test('the assembled wasm package imports and compresses', opts, async () => {
+  const pkg = await loadPackage();
+  for (const f of [
+    'index.js', 'index.d.ts', 'LICENSE', 'README.md', 'package.json',
+    'engine/hyper-compress.js', 'engine/hyper-compress.wasm',
+    'lib/wasm/sdk.js', 'lib/wasm/glue.js',
+    'lib/sdk/node/options.js', 'lib/sdk/node/presets.js',
+    'lib/sdk/node/pdfa.js', 'lib/sdk/node/errors.js', 'lib/sdk/node/target.js',
+  ]) {
+    assert.ok(existsSync(path.join(PKG, f)), `package is missing ${f}`);
+  }
+  const input = new Uint8Array(readFileSync(FIXTURE));
+  const result = await pkg.compress(input, { preset: 'medium' });
+  assert.ok(result.compressedSize > 0);
+  assert.ok(result.compressedSize <= result.originalSize);
+  assert.equal(result.originalSize, input.length);
+  assert.deepEqual(
+    Array.from(result.data.slice(0, 5)),
+    Array.from(Buffer.from('%PDF-')),
+  );
+  assert.ok(Array.isArray(result.warnings));
+  assert.equal(typeof (await pkg.verifyPassword(input, 'x')), 'boolean');
+  for (const deflated of [false, true]) {
+    const xmp = await pkg.compress(xmpPdf(deflated), { preset: 'medium' });
+    assert.ok(
+      countMarker(xmp.data, 'HYPERXMPMARKER') > 0,
+      `${deflated ? 'deflated' : 'plain'} XMP must stay readable`,
+    );
+  }
+  let body = '';
+  for (let i = 0; i < 300; i++) {
+    body += `BT /F1 10 Tf 40 ${720 - (i % 60) * 11} Td (signed line ${i}) Tj ET\n`;
+  }
+  const kept = await pkg.compress(signedPdf(body), { preset: 'medium' });
+  assert.equal(kept.signed, true);
+  assert.equal(kept.signaturesRemoved, false);
+  const removed = await pkg.compress(signedPdf(body), {
+    preset: 'medium',
+    options: { removeSignatures: true },
+  });
+  assert.equal(removed.signed, false);
+  assert.equal(removed.signaturesRemoved, true);
+  assert.ok(removed.compressedSize < removed.originalSize);
+});
+
+test('unlocks RC4 and AES-128 files whose password has non-ASCII characters', opts, async () => {
+  const pkg = await loadPackage();
+  for (const fixture of LATIN1_PASSWORD_FIXTURES) {
+    const locked = new Uint8Array(readFileSync(fixture));
+    const name = path.basename(fixture);
+    assert.equal(await pkg.verifyPassword(locked, 'pässwört'), true, name);
+    assert.equal(await pkg.verifyPassword(locked, 'passwort'), false, name);
+    assert.equal(await pkg.verifyPassword(locked, ''), false, name);
+    const unlocked = await pkg.compress(locked, {
+      preset: 'medium',
+      password: 'pässwört',
+    });
+    assert.equal(countMarker(unlocked.data, '/Encrypt'), 0, name);
+  }
+});
