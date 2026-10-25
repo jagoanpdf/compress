@@ -1,0 +1,100 @@
+
+name: Build Browser WebAssembly
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: browser-wasm-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install depot_tools
+        shell: bash
+        run: |
+          git clone --depth 1 \
+            https://chromium.googlesource.com/chromium/tools/depot_tools.git \
+            "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+          echo "DEPOT_TOOLS_UPDATE=0" >> "$GITHUB_ENV"
+
+      - name: Download pinned PDFium
+        shell: bash
+        run: |
+          PIN="$(grep '^PDFIUM_PIN=' core/build/apply-tree.sh | cut -d= -f2)"
+          mkdir -p core/build/gsrc
+          cd core/build/gsrc
+          gclient config --unmanaged \
+            https://pdfium.googlesource.com/pdfium.git
+          gclient sync --revision "pdfium@$PIN" -D --no-history
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Build native prerequisites
+        shell: bash
+        run: |
+          core/build/apply-tree.sh
+          core/build/build-native.sh
+          sdk/native/build-dylib.sh
+
+      - name: Install Emscripten
+        shell: bash
+        run: |
+          git clone --depth 1 \
+            https://github.com/emscripten-core/emsdk.git "$HOME/emsdk"
+          "$HOME/emsdk/emsdk" install 4.0.22
+          "$HOME/emsdk/emsdk" activate 4.0.22
+          echo "$HOME/emsdk" >> "$GITHUB_PATH"
+          echo "EMSDK=$HOME/emsdk" >> "$GITHUB_ENV"
+
+      - name: Compile WebAssembly engine
+        shell: bash
+        run: |
+          source "$HOME/emsdk/emsdk_env.sh"
+          wasm/build-pdfium-wasm.sh
+          wasm/build-wasm.sh
+
+      - name: Build JavaScript modules
+        run: npm run build
+
+      - name: Verify browser artifacts
+        shell: bash
+        run: |
+          set -e
+          test -s wasm/out/hyper-compress.js
+          test -s wasm/out/hyper-compress.wasm
+          test -s dist/wasm/glue.js
+          test -s dist/wasm/sdk.js
+          echo "Browser engine files verified."
+
+      - name: Commit generated browser files
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -f \
+            wasm/out/hyper-compress.js \
+            wasm/out/hyper-compress.wasm \
+            dist/wasm/glue.js \
+            dist/wasm/sdk.js
+
+          if git diff --cached --quiet; then
+            echo "No generated file changes."
+          else
+            git commit -m "Build browser WebAssembly assets"
+            git push
+          fi
